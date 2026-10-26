@@ -6,7 +6,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use http_request_zabbix::{ZabbixInstance, AuthType};
+//! # #[cfg(feature = "blocking")]
+//! # {
+//! use http_request_zabbix::{AuthType, ZabbixInstance};
 //!
 //! let zabbix = ZabbixInstance::builder("http://zabbix.example.com/zabbix")
 //!     .build()
@@ -15,13 +17,20 @@
 //!     .unwrap();
 //!
 //! println!("Zabbix Version: {}", zabbix.get_version().unwrap());
+//! # }
 //! ```
 
+#[cfg(feature = "blocking")]
 use reqwest::blocking::Client;
+#[cfg(feature = "blocking")]
 use semver::{Version, VersionReq};
 use serde_json::Value;
 use thiserror::Error;
+#[cfg(any(feature = "blocking", feature = "async"))]
 use uuid::Uuid;
+
+#[cfg(feature = "async")]
+pub mod async_api;
 
 /// Enum representing the type of authentication to use.
 ///
@@ -52,7 +61,7 @@ pub enum AuthType {
 /// # Examples
 ///
 /// ```no_run
-/// use http_request_zabbix::{ApiRequestParams, AuthType, ZabbixInstance};
+/// use http_request_zabbix::ApiRequestParams;
 ///
 /// let params_json = ApiRequestParams::from(serde_json::json!({"output": ["host", "name"], "limit": 1}));
 /// let params_string = ApiRequestParams::from("{\"output\": [\"host\", \"name\"], \"limit\": 1}");
@@ -105,7 +114,73 @@ pub enum ZabbixError {
     Other(String),
 }
 
+#[cfg(any(feature = "blocking", feature = "async"))]
+fn parse_params<P: Into<ApiRequestParams>>(params: P) -> Result<Value, ZabbixError> {
+    match params.into() {
+        ApiRequestParams::Json(value) => Ok(value),
+        ApiRequestParams::String(value) => serde_json::from_str(&value).map_err(ZabbixError::from),
+    }
+}
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+fn prepare_request(
+    method: &str,
+    params: Value,
+    token: &str,
+    need_auth_in_body: bool,
+) -> (Value, Option<String>) {
+    let mut payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": Uuid::new_v4().to_string()
+    });
+
+    let authorization = if token.is_empty() {
+        None
+    } else if need_auth_in_body {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("auth".to_string(), Value::String(token.to_string()));
+        }
+        None
+    } else {
+        Some(format!("Bearer {token}"))
+    };
+
+    (payload, authorization)
+}
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+fn parse_response(text: &str) -> Result<String, ZabbixError> {
+    let json: Value = serde_json::from_str(text)?;
+
+    if let Some(error) = json.get("error") {
+        if error.is_object() {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown error");
+            let data = error.get("data").and_then(Value::as_str).unwrap_or("");
+            return Err(ZabbixError::ApiError {
+                message: message.to_string(),
+                data: data.to_string(),
+            });
+        }
+        return Err(ZabbixError::Other(error.to_string()));
+    }
+
+    if let Some(result) = json.get("result") {
+        if let Some(value) = result.as_str() {
+            return Ok(value.to_string());
+        }
+        return Ok(result.to_string());
+    }
+
+    Err(ZabbixError::Other("Unknown response format".to_string()))
+}
+
 /// Represents an active connection to a Zabbix server.
+#[cfg(feature = "blocking")]
 pub struct ZabbixInstance {
     id: String,
     url: String,
@@ -116,6 +191,7 @@ pub struct ZabbixInstance {
     need_logout: bool,
 }
 
+#[cfg(feature = "blocking")]
 impl ZabbixInstance {
     /// Creates a new `ZabbixInstanceBuilder` to configure the connection.
     ///
@@ -134,6 +210,7 @@ impl ZabbixInstance {
 }
 
 /// A builder for creating a `ZabbixInstance`.
+#[cfg(feature = "blocking")]
 pub struct ZabbixInstanceBuilder {
     url: String,
     accept_invalid_certs: bool,
@@ -142,6 +219,7 @@ pub struct ZabbixInstanceBuilder {
     version: String,
 }
 
+#[cfg(feature = "blocking")]
 impl ZabbixInstanceBuilder {
     /// Creates a new builder with the given Zabbix URL.
     ///
@@ -281,23 +359,19 @@ impl ZabbixInstanceBuilder {
             "",
             self.need_auth_in_body,
         ) {
-            Ok(_) => {
-                return Ok(ZabbixInstance {
-                    id: Uuid::new_v4().to_string(),
-                    need_auth_in_body: self.need_auth_in_body,
-                    token: token,
-                    request_client: client,
-                    url: self.url,
-                    version: self.version,
-                    need_logout: false,
-                });
-            }
-            Err(e) => {
-                return Err(ZabbixError::ApiError {
-                    message: "Invalid token".to_string(),
-                    data: e.to_string(),
-                });
-            }
+            Ok(_) => Ok(ZabbixInstance {
+                id: Uuid::new_v4().to_string(),
+                need_auth_in_body: self.need_auth_in_body,
+                token,
+                request_client: client,
+                url: self.url,
+                version: self.version,
+                need_logout: false,
+            }),
+            Err(e) => Err(ZabbixError::ApiError {
+                message: "Invalid token".to_string(),
+                data: e.to_string(),
+            }),
         }
     }
 
@@ -330,7 +404,7 @@ impl ZabbixInstanceBuilder {
         Ok(ZabbixInstance {
             id: Uuid::new_v4().to_string(),
             need_auth_in_body: self.need_auth_in_body,
-            token: token,
+            token,
             request_client: client,
             url: self.url,
             version: self.version,
@@ -339,6 +413,7 @@ impl ZabbixInstanceBuilder {
     }
 }
 
+#[cfg(feature = "blocking")]
 impl ZabbixInstance {
     /// Returns the internally generated UUID for this instance.
     ///
@@ -493,10 +568,7 @@ impl ZabbixInstance {
         method: &str,
         params: P,
     ) -> Result<String, ZabbixError> {
-        let params_val = match params.into() {
-            ApiRequestParams::Json(val) => val,
-            ApiRequestParams::String(s) => serde_json::from_str(&s).map_err(ZabbixError::from)?,
-        };
+        let params_val = parse_params(params)?;
 
         Self::zabbix_raw_request(
             &self.request_client,
@@ -516,26 +588,14 @@ impl ZabbixInstance {
         token: &str,
         need_auth_in_body: bool,
     ) -> Result<String, ZabbixError> {
+        let (payload, authorization) = prepare_request(method, params, token, need_auth_in_body);
+
         let mut request_builder = client
             .post(format!("{}/api_jsonrpc.php", url))
             .header("Content-Type", "application/json-rpc");
 
-        let mut payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": Uuid::new_v4().to_string()
-        });
-
-        if token != "" {
-            if !need_auth_in_body {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", token));
-            } else {
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("auth".to_string(), Value::String(String::from(token)));
-                }
-            }
+        if let Some(value) = authorization {
+            request_builder = request_builder.header("Authorization", value);
         }
 
         let response = request_builder.json(&payload).send()?;
@@ -547,36 +607,11 @@ impl ZabbixInstance {
             )));
         }
 
-        let text = response.text()?;
-
-        let json: Value = serde_json::from_str(&text)?;
-
-        if let Some(error) = json.get("error") {
-            if error.is_object() {
-                let msg = error
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown error");
-                let data = error.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                return Err(ZabbixError::ApiError {
-                    message: msg.to_string(),
-                    data: data.to_string(),
-                });
-            }
-            return Err(ZabbixError::Other(error.to_string()));
-        }
-
-        if let Some(result) = json.get("result") {
-            if let Some(s) = result.as_str() {
-                return Ok(s.to_string());
-            }
-            return Ok(result.to_string());
-        }
-
-        Err(ZabbixError::Other("Unknown response format".to_string()))
+        parse_response(&response.text()?)
     }
 }
 
+#[cfg(feature = "blocking")]
 impl Drop for ZabbixInstance {
     fn drop(&mut self) {
         if self.need_logout {
@@ -585,7 +620,7 @@ impl Drop for ZabbixInstance {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "blocking"))]
 mod tests {
     use super::*;
     use mockito::Server;
